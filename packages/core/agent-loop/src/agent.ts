@@ -358,9 +358,11 @@ export class ReactLoopAgent implements Agent {
     const { assembly } = decision
     const renderedPrompt = renderPrompt(assembly)
     let firstAttempt = true
+    let retryRoute: { provider: string; model: string } | undefined
     while (true) {
-      const { config, preparedCall } = await this.prepareRequest(turn, step, signal)
-      const startsRequestSeries = firstAttempt && decision.startsRequestSeries === true
+      const { config, preparedCall } = await this.prepareRequest(turn, step, signal, retryRoute)
+      const startsRequestSeries = retryRoute !== undefined
+        || (firstAttempt && decision.startsRequestSeries === true)
       const commits = this.systemPrompt.project(renderedPrompt, {
         inHistory: preparedCall?.systemPromptUpdate === 'in-history',
         startsSeries: startsRequestSeries
@@ -445,11 +447,14 @@ export class ReactLoopAgent implements Agent {
             'assistant/attempt',
             () => this.session.append('assistant/attempt', { turn, step, stream: live.stream }).seq,
           )
+          const partial = live.blocks().length > 0 || live.interruptedBlocks().length > 0
           const action = await this.dispatch.waterfall(
             'agent/request-error', {
               turn,
               step,
               provider: request.provider,
+              model: request.model,
+              partial,
               failure: finish.failure,
               retryPolicy: preparedCall?.retryPolicy,
               signal,
@@ -460,6 +465,7 @@ export class ReactLoopAgent implements Agent {
           if (action?.kind !== 'retry') {
             throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
           }
+          if (!partial && action.route !== undefined) retryRoute = action.route
           continue
         }
 
@@ -502,6 +508,7 @@ export class ReactLoopAgent implements Agent {
     turn: number,
     step: number,
     signal: AbortSignal,
+    routeOverride?: { provider: string; model: string },
   ): Promise<{ config: LlmCallConfig; preparedCall?: PreparedLlmCall }> {
     const { session } = this
 
@@ -517,28 +524,39 @@ export class ReactLoopAgent implements Agent {
       : undefined
     const reasoningEffort = this.options.reasoningEffort ?? persistedReasoningEffort
     const maxTokens = this.options.maxTokens
-    const seedConfig = deepFreeze(structuredClone(
-      this.requestHeaderLogged
-        // oxlint-disable-next-line typescript/no-non-null-assertion -- the instance logged the header it now folds
-        ? requestProposal(persistedHeader!)
-        : {
-          ...route,
-          ...reasoningEffort === undefined ? {} : { reasoningEffort },
-          ...maxTokens === undefined ? {} : { maxTokens },
-        },
-    ))
+    const seed = this.requestHeaderLogged
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- the instance logged the header it now folds
+      ? { ...requestProposal(persistedHeader!) }
+      : {
+        ...route,
+        ...reasoningEffort === undefined ? {} : { reasoningEffort },
+        ...maxTokens === undefined ? {} : { maxTokens },
+      }
+    if (routeOverride !== undefined) {
+      const routeChanged = seed.provider !== routeOverride.provider || seed.model !== routeOverride.model
+      Object.assign(seed, routeOverride)
+      if (routeChanged) delete seed.reasoningEffort
+    }
+    const seedConfig = deepFreeze(structuredClone(seed))
     const proposedConfig = await this.dispatch.waterfall(
       'agent/request', { turn, step, signal },
       () => Promise.resolve(seedConfig),
     )
     signal.throwIfAborted()
-    if (!proposedConfig.provider || !proposedConfig.model) {
+    const routedConfig: LlmCallConfig = routeOverride === undefined
+      ? proposedConfig
+      : { ...proposedConfig, ...routeOverride }
+    if (routeOverride !== undefined
+      && (proposedConfig.provider !== routeOverride.provider || proposedConfig.model !== routeOverride.model)) {
+      delete routedConfig.reasoningEffort
+    }
+    if (!routedConfig.provider || !routedConfig.model) {
       throw new Error(`agent "${this.id}" has no provider/model: set AgentOptions.provider and AgentOptions.model or supply both via the agent/request waterfall`)
     }
     let config: LlmCallConfig
     let preparedCall: PreparedLlmCall | undefined
     try {
-      preparedCall = await this.loopCtx.llm.prepareCall(proposedConfig, signal)
+      preparedCall = await this.loopCtx.llm.prepareCall(routedConfig, signal)
       config = preparedCall.config
     } catch (error: unknown) {
       // Middleware may serve an unregistered route; terminal dispatch still requires an adapter.

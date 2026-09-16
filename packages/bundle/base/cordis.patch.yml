@@ -83,6 +83,18 @@
 
     - id: llm-retry
       name: '@deepseek-ai/dsh-llm-retry'
+      config:
+        # The active session route remains primary; these are only tried after
+        # a retryable quota/rate-limit/availability failure.
+        fallbacks:
+          - provider: openrouter
+            model: deepseek/deepseek-v4-flash
+          - provider: deepseek-official
+            model: deepseek-flash
+          - provider: openrouter
+            model: google/gemma-4-31b-it:free
+          - provider: openai-codex
+            model: gpt-5.3-codex-spark
 
     # User-settings document (`$DSH_HOME/settings.yaml`, hot-reloaded): a
     # `llm-deepseek:` or `llm-pi-ai:` section there overrides the adapter entries

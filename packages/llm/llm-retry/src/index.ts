@@ -19,21 +19,41 @@ export type { LlmRetryEventData, LlmRetryStartedEventData } from './types.ts'
 export { RetryId } from './brand.ts'
 
 export const name = 'llm-retry'
-export const inject = ['agents', 'sessionProjections']
+export const inject = ['agents', 'sessionProjections', 'llm']
 
-/** This policy executor has no config; providers own `retryPolicy`. */
-export type Config = Readonly<Record<string, never>>
+/** A provider/model route tried after the active route fails recoverably. */
+export interface FallbackRoute {
+  provider: string
+  model: string
+}
+
+/** Provider-owned retry plus optional cross-provider fallback routes. */
+export interface Config {
+  fallbacks?: FallbackRoute[]
+}
 
 /** Runtime schema for {@link Config}. */
-export const Config = z.object({}) as unknown as z<Config>
+export const Config: z<Config> = z.object({
+  fallbacks: z.array(z.object({
+    provider: z.string(),
+    model: z.string(),
+  })).default([]),
+})
 
 function validateConfig(config: Config): void {
-  const [key] = Object.keys(config)
-  if (key === undefined) return
-  if (key === 'retryPolicy') {
-    throw new Error('llm-retry: retryPolicy belongs under each provider configuration')
+  for (const key of Object.keys(config)) {
+    if (key !== 'fallbacks') {
+      if (key === 'retryPolicy') {
+        throw new Error('llm-retry: retryPolicy belongs under each provider configuration')
+      }
+      throw new Error(`llm-retry: unknown key "${key}"`)
+    }
   }
-  throw new Error(`llm-retry: unknown key "${key}"`)
+  for (const route of config.fallbacks ?? []) {
+    if (route.provider.trim() === '' || route.model.trim() === '') {
+      throw new Error('llm-retry: fallback routes need non-empty provider and model')
+    }
+  }
 }
 
 /** Non-serializable hooks used to make timing policy deterministic in tests. */
@@ -139,6 +159,30 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
   const random = internals.random ?? Math.random
   const lifetime = new AbortController()
   const active = new Set<Promise<RequestErrorAction>>()
+  const fallbackIndexes = new Map<string, number>()
+
+  function fallbackKey(agent: Agent, turn: number, step: number): string {
+    return `${agent.id}:${turn}:${step}`
+  }
+
+  function nextFallback(agent: Agent, turn: number, step: number, provider: string, model: string): FallbackRoute | undefined {
+    if (config.fallbacks === undefined || config.fallbacks.length === 0) return undefined
+    const routes = config.fallbacks
+    if (routes.length === 0) return undefined
+    const key = fallbackKey(agent, turn, step)
+    let index = fallbackIndexes.get(key) ?? 0
+    const providers = new Set(ctx.llm.listProviders().map(entry => entry.id))
+    while (index < routes.length) {
+      const route = routes[index++]
+      if (route === undefined) break
+      if (route.provider === provider && route.model === model) continue
+      if (!providers.has(route.provider)) continue
+      fallbackIndexes.set(key, index)
+      return route
+    }
+    fallbackIndexes.set(key, index)
+    return undefined
+  }
 
   function track(operation: Promise<RequestErrorAction>): Promise<RequestErrorAction> {
     const tracked = operation.finally(() => active.delete(tracked))
@@ -158,6 +202,7 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
     retryId: RetryId,
     delayMs: number,
     signal: AbortSignal,
+    route?: FallbackRoute,
   ): Promise<RequestErrorAction> {
     const fusedSignal = AbortSignal.any([signal, lifetime.signal])
     if (fusedSignal.aborted) return
@@ -188,11 +233,11 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
     agent.session.append('llm/retry', eventData)
     if (!await cancellableDelay(delayMs, fusedSignal)) return
     agent.session.append('llm/retry-started', { retryId, turn, step, retry })
-    return { kind: 'retry' }
+    return { kind: 'retry', ...route === undefined ? {} : { route } }
   }
 
   async function recover(
-    { agent, turn, step, provider, failure, retryPolicy: policy, signal }: Parameters<Events['agent/request-error']>[0],
+    { agent, turn, step, provider, model, partial, failure, retryPolicy: policy, signal }: Parameters<Events['agent/request-error']>[0],
     next: () => Promise<RequestErrorAction>,
   ): Promise<RequestErrorAction> {
     if (policy === undefined) return next()
@@ -223,6 +268,7 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
     if (policy.mode === 'normal' && previousRetry >= policy.maxRetries) return next()
     const retry = previousRetry + 1
     const retryId = previous?.retryId ?? RetryId(randomUUID())
+    const route = partial ? undefined : nextFallback(agent, turn, step, provider, model)
     let delayMs: number
     if (failure.providerRetryAfterMs !== undefined
       && Number.isFinite(failure.providerRetryAfterMs)
@@ -237,7 +283,7 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
       delayMs = localDelay(policy, retry, random)
     }
 
-    return backoff(agent, turn, step, failure, provider, policy, policyKey, retry, retryId, delayMs, signal)
+    return backoff(agent, turn, step, failure, provider, policy, policyKey, retry, retryId, delayMs, signal, route)
   }
 
   const disposeListener = ctx.on('agent/request-error', (

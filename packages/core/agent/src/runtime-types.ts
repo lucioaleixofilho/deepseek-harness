@@ -119,7 +119,11 @@ export type PreStepDecision =
   }
 
 /** Action returned by a listener that owns model-request recovery. */
-export type RequestErrorAction = { kind: 'retry' } | undefined
+export type RequestErrorAction = {
+  kind: 'retry'
+  /** Optional provider/model replacement for the next attempt in this request series. */
+  route?: { provider: string; model: string }
+} | undefined
 
 /** Why a session lifecycle began; seeded creates are `startup`, while persisted loads are `resume`. */
 export type SessionStartSource = 'startup' | 'resume' | 'clear' | 'compact'
@@ -354,13 +358,15 @@ declare module '@deepseek-ai/cordis' {
      * @param payload.turn - the turn containing the failed request.
      * @param payload.step - the step containing the failed request attempt.
      * @param payload.provider - the provider selected for the failed request.
+      * @param payload.model - the model selected for the failed request.
+      * @param payload.partial - whether the failed attempt already emitted assistant content.
      * @param payload.failure - serializable facts normalized at the final adapter boundary.
      * @param payload.retryPolicy - the policy of the adapter registration that served the failed request.
      * @param payload.signal - the turn abort signal.
      * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners receive only that agent.
      * @mode waterfall
      */
-    'agent/request-error'(this: Scoped<Agent>, payload: { agent: Agent; turn: number; step: number; provider: string; failure: LlmFailure; retryPolicy: ResolvedRetryPolicy | undefined; signal: AbortSignal }, next: () => Promise<RequestErrorAction>): Promise<RequestErrorAction>
+    'agent/request-error'(this: Scoped<Agent>, payload: { agent: Agent; turn: number; step: number; provider: string; model: string; partial: boolean; failure: LlmFailure; retryPolicy: ResolvedRetryPolicy | undefined; signal: AbortSignal }, next: () => Promise<RequestErrorAction>): Promise<RequestErrorAction>
     /**
      * Process-local assistant-stream publication. Chunk frames are transient;
      * the loop appends one final v2 `assistant/message` or `assistant/attempt`

@@ -104,6 +104,7 @@ async function harness(
   policies: Readonly<Record<string, RetryPolicyConfig | undefined>> = { mock: normalConfig() },
   beforeRetry?: (ctx: Context) => void,
   internals: retry.RetryInternals = {},
+  retryConfig: retry.Config = {},
 ): Promise<{ ctx: Context; retryFiber: Fiber; disposeAdapter: () => void }> {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
@@ -115,7 +116,7 @@ async function harness(
   beforeRetry?.(ctx)
   adapter.configureRetryPolicies(policies)
   const retryFiber = await ctx.plugin(Object.assign((inner: Context) => {
-    retry.apply(inner, {}, internals)
+    retry.apply(inner, retryConfig, internals)
   }, { inject: retry.inject }))
   await ctx.plugin(AgentLoop, { agents: [] })
   const disposeAdapter = ctx.llm.registerAdapter(['mock', 'other'], adapter)
@@ -223,6 +224,37 @@ describe('provider-routed retry policy', () => {
       content: [{ type: 'text', text: 'done' }],
       source: { kind: 'model', provider: 'mock', model: 'mock' },
     })
+  })
+
+  it('switches to the configured fallback route after a recoverable failure', async () => {
+    const adapter = new ScriptedAdapter([
+      new LlmError('quota', 'RATE_LIMIT', { status: 429 }),
+      textResponse('fallback done'),
+    ])
+    ;({ ctx: context } = await harness(adapter, {
+      mock: normalConfig({
+        backoff: { initialDelayMs: 1, maxDelayMs: 1, jitterRatio: 0 },
+        retryableCodes: ['RATE_LIMIT'],
+      }),
+    }, undefined, {}, {
+      fallbacks: [{ provider: 'other', model: 'fallback' }],
+    }))
+    const agent = await context.agentLoop.create(SessionId('retry-fallback'), {
+      provider: 'mock',
+      model: 'primary',
+    })
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    expect(adapter.requests.map(request => ({ provider: request.provider, model: request.model }))).toEqual([
+      { provider: 'mock', model: 'primary' },
+      { provider: 'other', model: 'fallback' },
+    ])
+    expect(agent.session.snapshotEvents().filter(event => event.type === 'request/header').map(event => event.data.reason)).toEqual([
+      'initial',
+      'change',
+    ])
   })
 
   it('retries an EMPTY_RESPONSE error finish under the default retryable codes', async () => {

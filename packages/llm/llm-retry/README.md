@@ -25,7 +25,7 @@ Mount `@deepseek-ai/dsh-llm-retry` to retry failed model requests at durable age
 <a id="use-this-package"></a>
 ## Use this package
 
-Mount this plugin when agent runs should recover from transient model-request failures — rate limits, server errors, timeouts, transport errors — instead of ending the turn. It is the executor: the retry policy itself lives on each provider adapter's configuration, and this package has no configuration of its own.
+Mount this plugin when agent runs should recover from transient model-request failures — rate limits, server errors, timeouts, transport errors — instead of ending the turn. It is the executor: retry policy lives on each provider adapter, while optional fallback routes are configured on this plugin.
 
 ### When to choose it
 
@@ -45,9 +45,15 @@ Choose it when a composition runs the agent loop and wants durable request recov
         jitterRatio: 0.2
 
 - name: '@deepseek-ai/dsh-llm-retry'
+  config:
+    fallbacks:
+      - provider: openrouter
+        model: deepseek/deepseek-v4-flash
+      - provider: openai-codex
+        model: gpt-5.3-codex-spark
 ```
 
-Omission of `retryPolicy` uses normal mode: five retries for `EMPTY_RESPONSE`, `RATE_LIMIT`, `SERVER`, `TIMEOUT`, and `TRANSPORT`, with bounded exponential backoff from 500 ms to 10 seconds and 10 percent jitter. Normal mode can change its finite budget, eligible codes, and backoff; always mode asks downstream recovery first, then retries every model-request failure without an attempt limit, stopping only on success, cancellation, or plugin disposal.
+Omission of `retryPolicy` uses normal mode: five retries for `EMPTY_RESPONSE`, `RATE_LIMIT`, `SERVER`, `TIMEOUT`, and `TRANSPORT`, with bounded exponential backoff from 500 ms to 10 seconds and 10 percent jitter. Normal mode can change its finite budget, eligible codes, and backoff; always mode asks downstream recovery first, then retries every model-request failure without an attempt limit, stopping only on success, cancellation, or plugin disposal. Fallbacks use the session's current provider/model as primary, skip unavailable providers, advance without cycling, and are never selected after partial assistant output.
 
 ### What you can observe
 

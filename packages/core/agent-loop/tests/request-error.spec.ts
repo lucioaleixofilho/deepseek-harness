@@ -102,6 +102,58 @@ describe('agent/request-error', () => {
       event.type === 'request/header' ? [event.data.reason] : [])).toEqual(['initial'])
   })
 
+  it('retries the same prompt on a listener-selected replacement route', async () => {
+    const adapter = new MockAdapter([
+      [{ type: 'finish', reason: { kind: 'error', failure: { message: 'quota', code: 'RATE_LIMIT' } } }],
+      textResponse('fallback ok'),
+    ])
+    const ctx = await harness(adapter)
+    const agent = await ctx.agentLoop.create(SessionId('request-error-route'), { provider: 'mock', model: 'primary' })
+    const seen: string[] = []
+    ctx.on('agent/request-error', async ({ model }) => {
+      seen.push(model)
+      return { kind: 'retry', route: { provider: 'mock', model: 'fallback' } }
+    })
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    expect(seen).toEqual(['primary'])
+    expect(adapter.requests.map(request => ({ provider: request.provider, model: request.model }))).toEqual([
+      { provider: 'mock', model: 'primary' },
+      { provider: 'mock', model: 'fallback' },
+    ])
+    expect(agent.session.snapshotEvents().filter(event => event.type === 'request/header').map(event => event.data.reason)).toEqual([
+      'initial',
+      'change',
+    ])
+  })
+
+  it('does not switch routes after a partial assistant stream', async () => {
+    const adapter = new MockAdapter([
+      [
+        { type: 'block-start', index: 0, blockType: 'text' },
+        { type: 'text-delta', index: 0, text: 'partial' },
+        { type: 'finish', reason: { kind: 'error', failure: { message: 'quota', code: 'RATE_LIMIT' } } },
+      ],
+      textResponse('same route retry ok'),
+    ])
+    const ctx = await harness(adapter)
+    const agent = await ctx.agentLoop.create(SessionId('request-error-partial'), { provider: 'mock', model: 'primary' })
+    const seen: boolean[] = []
+    ctx.on('agent/request-error', async ({ partial }) => {
+      seen.push(partial)
+      return { kind: 'retry', route: { provider: 'mock', model: 'fallback' } }
+    })
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    expect(seen).toEqual([true])
+    expect(adapter.requests).toHaveLength(2)
+    expect(adapter.requests.map(request => request.model)).toEqual(['primary', 'primary'])
+  })
+
   it('lets cancellation win over a retry action', async () => {
     const adapter = new MockAdapter([fail('busy', 'RATE_LIMIT'), textResponse('unused')])
     const ctx = await harness(adapter)
