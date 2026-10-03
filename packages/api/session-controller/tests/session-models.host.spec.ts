@@ -1,11 +1,11 @@
 /**
  * Session Controller model-directory and selection behavior: dynamic provider grouping,
  * provider-local catalog failures, logged-selection restoration without stale
- * catalog injection, unavailable-model refusals, and the prompt-assembly
+ * catalog injection, advisory pass-through models, and the prompt-assembly
  * boundary for a running selection change.
  */
 
-import { describe, expect, it, vi, onTestFinished } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { agentEvents } from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -20,10 +20,10 @@ import SessionStore from '@deepseek-ai/dsh-session'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionPromptRequest, SessionRequestId } from '../src/types.ts'
 import { ApiSessionAgentController } from '../src/agent.ts'
-import { buildModelCatalog, hasProviderApiKey } from '../src/catalog.ts'
+import { buildModelCatalog } from '../src/catalog.ts'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
-import { createSessionTestController, createSessionTestRemote } from './test-remote.ts'
+import { createSessionTestRemote } from './test-remote.ts'
 
 function request<P>(payload: P): P {
   return payload
@@ -88,11 +88,12 @@ async function harness(logged?: {
   model: string
   reasoningEffort?: ReasoningEffortId
   adapterDefaults?: LlmCallConfigAdapterDefaults
-}, ctx = new Context()): Promise<{
+}): Promise<{
   ctx: Context
   agent: Agent
   sessionId: SessionId
 }> {
+  const ctx = new Context()
   await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt, { personaPrefix: '' })
   await ctx.plugin(LlmRuntime)
@@ -131,7 +132,7 @@ async function harness(logged?: {
     ctx,
     inbox: { nextTurn: [], nextStep: [] },
   } as unknown as Agent
-  await ctx.agents.register(agent)
+  ctx.agents.register(agent)
   return { ctx, agent, sessionId: session.id }
 }
 
@@ -145,7 +146,7 @@ function registerTextOnly(ctx: Context): void {
     override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
       return Promise.resolve({ provider, id: model, name: model, inputModalities: ['text'] })
     }
-  }('Text Only', [{ provider: 'text-only', id: 'plain', name: 'Plain' }]))
+  }('Text Only', []))
 }
 
 /** Resolve the Client-visible next selection from durable state and the Host default. */
@@ -265,6 +266,7 @@ describe('Web session model selection', () => {
       ],
     }))
     expect(result.ok).toBe(true)
+    expect(followup).not.toHaveBeenCalled()
     expect((steer.mock.calls[0]?.[0] as UserMessage).content).toEqual([
       { type: 'text', text: 'look at this' },
       {
@@ -296,7 +298,7 @@ describe('Web session model selection', () => {
     }))).selected).toEqual({ provider: 'text-only', model: 'plain' })
 
     agent.session.append('user/message', {
-      id: 'summary', role: 'user', source: { kind: 'compact-checkpoint', compactionId: 'model-selection-compaction' },
+      id: 'summary', role: 'user', source: { kind: 'plugin', plugin: 'compact' },
       content: [{ type: 'text', text: 'image summarized' }],
     } as never, {
       surfaceOp: { op: 'replace', startSeq: imageEvent.seq, endSeq: imageEvent.seq },
@@ -345,66 +347,6 @@ describe('Web session model selection', () => {
     expect(readImage).toHaveBeenCalledOnce()
     await ctx.fiber.dispose()
   })
-  it('checks configured key references even for empty catalogs and skips profiles without keys', async () => {
-    const ctx = new Context()
-    await ctx.plugin(LlmRuntime)
-    const describe = vi.fn(async () => ({ configured: true, writable: true }))
-    ctx.provide('credentials', { describe } as never)
-    ctx.provide('settings', { describe: () => [{ ns: 'profiles', value: {
-      providers: { blank: { apiKeyEnv: '' }, absent: {}, configured: { apiKeyEnv: 'CUSTOM_KEY' } },
-    } }] } as never)
-    const routes = ['missing', 'blank', 'absent', 'configured']
-    ctx.effect(() => ctx.llm.registerConfigurableProviders(routes.map(provider => ({
-      provider, displayName: provider, settingsNs: 'profiles',
-      settingsPath: provider === 'missing' ? ['missing', 'nested'] : ['providers', provider],
-    }))))
-    try {
-      expect(await hasProviderApiKey(ctx)).toBe(true)
-      expect(describe).toHaveBeenCalledExactlyOnceWith('CUSTOM_KEY')
-      describe.mockRejectedValueOnce(new Error('credential read failed'))
-      await expect(hasProviderApiKey(ctx)).rejects.toThrow('credential read failed')
-    } finally { await ctx.fiber.dispose() }
-  })
-
-  it.each(['settings', 'credentials'] as const)('refuses account initialization without %s inspection', async (missing) => {
-    const ctx = new Context()
-    if (missing !== 'settings') ctx.provide('settings', {} as never)
-    if (missing !== 'credentials') ctx.provide('credentials', {} as never)
-    try {
-      await expect(hasProviderApiKey(ctx)).rejects.toMatchObject({ code: 'session/provider-credentials-unavailable' })
-    } finally { await ctx.fiber.dispose() }
-  })
-
-  it.each([false, true])('account login replaces a saved default only without another API key: %s', async (configuredKey) => {
-    const { configurationFixture } = await import('../../../settings/settings/tests/configuration-fixture.ts')
-    const configured = await configurationFixture({ hmr: false })
-    const { ctx } = await harness(undefined, configured.ctx)
-    ctx.effect(() => ctx.llm.registerAdapter(['deepseek-account'], new CatalogAdapter('Account', [
-      { provider: 'deepseek-account', id: 'first-model', name: 'First' },
-      { provider: 'deepseek-account', id: 'second-model', name: 'Second' },
-    ], REASONING)))
-    const describe = vi.fn(async () => ({ configured: configuredKey, writable: true }))
-    ctx.provide('credentials', { describe } as never)
-    ctx.effect(() => ctx.llm.registerConfigurableProviders([
-      { provider: 'deepseek-account', displayName: 'Account', settingsNs: 'account', settingsPath: [] },
-      { provider: 'removed-model-provider', displayName: 'Custom', settingsNs: 'first', settingsPath: ['providers', 'custom'] },
-    ]))
-    vi.spyOn(ctx.settings, 'describe').mockReturnValue([{
-      ns: 'first' as never, autoGenerate: false, schema: {}, revision: 0, applies: 'live',
-      value: { providers: { custom: { apiKeyEnv: 'CUSTOM_API_KEY', models: [] } } },
-    }])
-    await ctx.agentDefaultModel.saveSelection({ provider: 'removed', model: 'saved' })
-    const controller = createSessionTestController(ctx, {
-      defaultModelSelection: () => ctx.agentDefaultModel.currentSelection(), cwd: '/tmp',
-    })
-    await controller.initializeDefaultModel()
-    expect(describe).toHaveBeenCalledWith('CUSTOM_API_KEY')
-    expect(ctx.agentDefaultModel.currentSelection()).toEqual(configuredKey
-      ? { provider: 'removed', model: 'saved' }
-      : { provider: 'deepseek-account', model: 'first-model', reasoningEffort: 'high' })
-    await ctx.fiber.dispose()
-  })
-
   it('groups successful providers and leaves an unlisted current selection out of the catalog', async () => {
     const { ctx, sessionId } = await harness({
       provider: 'deepseek-official',
@@ -486,7 +428,7 @@ describe('Web session model selection', () => {
     await ctx.fiber.dispose()
   })
 
-  it('rejects unlisted models and switches available models only after the next assembly', async () => {
+  it('accepts an advisory-unlisted model, rejects an unavailable provider, and switches only after the next assembly', async () => {
     const { ctx, agent, sessionId } = await harness()
     const remote = createSessionTestRemote(ctx, { defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }), cwd: '/tmp' })
     const seed: LlmCallConfig = { provider: 'seed', model: 'seed', temperature: 0.2 }
@@ -498,12 +440,12 @@ describe('Web session model selection', () => {
     const selected = expectValue(await remote.selectModel(request({
       sessionId,
       provider: 'deepseek-official',
-      model: 'deepseek-reasoner',
+      model: 'private-preview',
       reasoningEffort: 'max',
     })))
     expect(selected.selected).toEqual({
       provider: 'deepseek-official',
-      model: 'deepseek-reasoner',
+      model: 'private-preview',
       reasoningEffort: 'max',
     })
     await expect(agentEvents(ctx, agent).waterfall(
@@ -511,26 +453,26 @@ describe('Web session model selection', () => {
     )).resolves.toEqual(seed)
 
     expect((await ctx.systemPrompt.assemble()).variables)
-      .toMatchObject({ provider: 'deepseek-official', model: 'deepseek-reasoner' })
+      .toMatchObject({ provider: 'deepseek-official', model: 'private-preview' })
     await expect(agentEvents(ctx, agent).waterfall(
       'agent/request', { turn: 1, step: 1, signal }, () => Promise.resolve(seed),
     )).resolves.toMatchObject({
       provider: 'deepseek-official',
-      model: 'deepseek-reasoner',
+      model: 'private-preview',
       reasoningEffort: 'max',
     })
 
     const unsupported = await remote.selectModel(request({
       sessionId,
       provider: 'deepseek-official',
-      model: 'deepseek-reasoner',
+      model: 'private-preview',
       reasoningEffort: 'medium',
     }))
     expect(unsupported).toMatchObject({
       ok: false,
       error: {
         code: 'session/model-unavailable',
-        message: 'provider "deepseek-official" model "deepseek-reasoner" does not support reasoning effort "medium"',
+        message: 'provider "deepseek-official" model "private-preview" does not support reasoning effort "medium"',
       },
     })
 
@@ -543,7 +485,7 @@ describe('Web session model selection', () => {
       ok: false,
       error: {
         code: 'session/model-unavailable',
-        message: 'Select an available model before sending a message.',
+        message: 'no adapter registered for provider "missing"',
         details: { provider: 'missing', model: 'model' },
       },
     })
@@ -554,13 +496,13 @@ describe('Web session model selection', () => {
     }))).toMatchObject({
       ok: false,
       error: {
-        code: 'session/model-unavailable',
-        message: 'Select an available model before sending a message.',
-        details: { provider: 'remote-rejected', model: 'model' },
+        code: 'gateway/internal',
+        message: 'fixture rejected the selection',
+        details: {},
       },
     })
     expect(currentSelection(ctx, sessionId))
-      .toEqual({ provider: 'deepseek-official', model: 'deepseek-reasoner', reasoningEffort: 'max' })
+      .toEqual({ provider: 'deepseek-official', model: 'private-preview', reasoningEffort: 'max' })
     await ctx.fiber.dispose()
   })
 
@@ -617,43 +559,15 @@ describe('Web session model selection', () => {
     await ctx.fiber.dispose()
   })
 
-  it('accepts consecutive model switches without writing the global default', async () => {
-    const { ctx, sessionId } = await harness()
-    const saves: Promise<void>[] = []
-    const operations: Promise<unknown>[] = []
-    onTestFinished(async () => {
-      await Promise.allSettled([...operations, ...saves])
-      await ctx.fiber.dispose()
-    })
-    const remote = createSessionTestRemote(ctx, {
-      defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }),
-      saveDefaultModelSelection: () => {
-        const save = Promise.resolve()
-        saves.push(save)
-        return save
-      },
-      cwd: '/tmp',
-    })
-
-    for (const model of ['deepseek-reasoner', 'deepseek-chat']) {
-      let returned = false
-      const operation = remote.selectModel({ sessionId, provider: 'deepseek-official', model })
-        .then((result) => { expectValue(result); returned = true })
-      operations.push(operation)
-      await expect.poll(() => returned).toBe(true)
-      expect(currentSelection(ctx, sessionId)).toMatchObject({ provider: 'deepseek-official', model })
-    }
-    expect(saves).toHaveLength(0)
-  })
-
-  it('changes only the addressed session and leaves the global default untouched', async () => {
+  it('saves an accepted selection as the default and survives a storage failure', async () => {
     const { ctx, sessionId } = await harness()
     const saved: unknown[] = []
+    let reject = false
     const remote = createSessionTestRemote(ctx, {
       defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }),
       saveDefaultModelSelection: (selection) => {
         saved.push(selection)
-        return Promise.resolve()
+        return reject ? Promise.reject(new Error('read-only document')) : Promise.resolve()
       },
       cwd: '/tmp',
     })
@@ -661,120 +575,54 @@ describe('Web session model selection', () => {
     expectValue(await remote.selectModel(request({
       sessionId, provider: 'deepseek-official', model: 'deepseek-reasoner', reasoningEffort: 'max',
     })))
-    expect(currentSelection(ctx, sessionId))
-      .toEqual({ provider: 'deepseek-official', model: 'deepseek-reasoner', reasoningEffort: 'max' })
-    // A per-session pick must never touch the deployment default.
-    expect(saved).toEqual([])
-    expect(ctx.agentDefaultModel.currentSelection())
-      .toEqual({ provider: 'deepseek-official', model: 'deepseek-chat' })
+    expect(saved).toEqual([
+      { provider: 'deepseek-official', model: 'deepseek-reasoner', reasoningEffort: 'max' },
+    ])
 
-    // A refused selection never becomes the session selection or anyone's default.
+    // A refused selection never becomes anyone's default.
     await remote.selectModel(request({ sessionId, provider: 'missing', model: 'model' }))
-    expect(saved).toHaveLength(0)
+    expect(saved).toHaveLength(1)
+
+    // Storage failing is not the selection failing: the switch already applies
+    // to this session, so the call still succeeds.
+    reject = true
+    const stillAccepted = expectValue(await remote.selectModel(request({
+      sessionId, provider: 'deepseek-official', model: 'deepseek-chat',
+    })))
+    expect(stillAccepted.selected).toEqual({ provider: 'deepseek-official', model: 'deepseek-chat', reasoningEffort: 'high' })
     expect(currentSelection(ctx, sessionId))
-      .toEqual({ provider: 'deepseek-official', model: 'deepseek-reasoner', reasoningEffort: 'max' })
+      .toEqual({ provider: 'deepseek-official', model: 'deepseek-chat', reasoningEffort: 'high' })
     await ctx.fiber.dispose()
   })
 
-  it('writes the global default through the explicit default bootstrap', async () => {
-    const { ctx } = await harness()
-    // No provider holds a key, so account bootstrap is the one that runs.
-    ctx.provide('settings', { describe: () => [] } as never)
-    ctx.provide('credentials', { describe: vi.fn() } as never)
-    const dispose = ctx.llm.registerAdapter(['deepseek-account'], new CatalogAdapter('Account', [
-      { provider: 'deepseek-account', id: 'basic', name: 'Basic' },
-    ]))
-    const saved: unknown[] = []
-    const controller = createSessionTestController(ctx, {
-      defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }),
-      saveDefaultModelSelection: (selection) => {
-        saved.push(selection)
-        return Promise.resolve()
-      },
-      cwd: '/tmp',
-    })
-
-    await controller.initializeDefaultModel()
-    expect(saved).toEqual([{ provider: 'deepseek-account', model: 'basic' }])
-    dispose()
-    await ctx.fiber.dispose()
-  })
-
-  it('admits saved selections without querying the advisory model catalog', async () => {
-    const { ctx, sessionId, agent } = await harness()
-    const followup = vi.fn()
-    Object.assign(agent, { followup })
-    const remote = createSessionTestRemote(ctx, {
-      defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }), cwd: '/tmp',
-    })
-    const list = vi.spyOn(ctx.llm, 'listModels')
-    list.mockRejectedValueOnce(new Error('credential storage offline'))
-    try {
-      expect(await remote.prompt(promptRequest({
-        sessionId, mode: 'queue', content: [{ type: 'text', text: 'hello' }],
-      }))).toMatchObject({ ok: true, value: { accepted: true } })
-      expect(list).not.toHaveBeenCalled()
-      expect(followup).toHaveBeenCalledOnce()
-    } finally {
-      list.mockRestore()
-      await ctx.fiber.dispose()
-    }
-  })
-
-  it('leaves uncatalogued adapters usable by core callers but unavailable to GUI selection', async () => {
+  it('refuses a prompt no adapter can route, and reports it on the directory', async () => {
     const { ctx, sessionId } = await harness()
-    ctx.llm.registerAdapter(['uncatalogued'], new class extends LlmAdapter {
-      override async *stream(_options: GenerateOptions): AsyncIterable<StreamChunk> {}
-    }())
-    try {
-      await expect(ctx.llm.resolveModelInfo('uncatalogued', 'custom-model')).resolves.toMatchObject({ id: 'custom-model' })
-      const remote = createSessionTestRemote(ctx, {
-        defaultModelSelection: () => ({ provider: 'uncatalogued', model: 'custom-model' }), cwd: '/tmp',
-      })
-      expect(await remote.selectModel({ sessionId, provider: 'uncatalogued', model: 'custom-model' }))
-        .toMatchObject({ ok: false, error: { code: 'session/model-unavailable' } })
-    } finally {
-      await ctx.fiber.dispose()
-    }
-  })
-
-  it('admits an unavailable saved route for execution without rewriting the selection', async () => {
-    const { ctx, sessionId, agent } = await harness()
-    const followup = vi.fn()
-    Object.assign(agent, { followup })
     const remote = createSessionTestRemote(ctx, {
       defaultModelSelection: () => ({ provider: 'deleted-gateway', model: 'deleted-model' }),
       cwd: '/tmp',
     })
 
-    const admitted = await remote.prompt(promptRequest({
+    // The client disabling its input is an affordance; this method stays
+    // callable, so the refusal has to live here.
+    const refused = await remote.prompt(promptRequest({
       sessionId, mode: 'queue' as const, content: [{ type: 'text' as const, text: 'hi' }],
     }))
-    expect(admitted).toMatchObject({ ok: true, value: { accepted: true } })
-    expect(followup).toHaveBeenCalledOnce()
+    expect(refused).toMatchObject({
+      ok: false,
+      error: { code: 'session/model-unavailable', details: { provider: 'deleted-gateway', model: 'deleted-model' } },
+    })
     const unavailableCatalog = await buildModelCatalog(ctx)
     expect(unavailableCatalog.routableProviders.includes(currentSelection(ctx, sessionId).provider)).toBe(false)
 
-    expect(await remote.selectModel(request({
+    // An advisory-unlisted model on a live route is NOT this: the route
+    // serves it, so the prompt goes through and nothing blocks.
+    expectValue(await remote.selectModel(request({
       sessionId, provider: 'deepseek-official', model: 'unlisted-but-served',
-    }))).toMatchObject({ ok: false, error: { code: 'session/model-unavailable' } })
-    expect(currentSelection(ctx, sessionId)).toEqual({ provider: 'deleted-gateway', model: 'deleted-model' })
-    await ctx.fiber.dispose()
-  })
-
-  it('admits a removed model without changing its saved selection', async () => {
-    const { ctx, sessionId, agent } = await harness({ provider: 'deepseek-official', model: 'removed-model' })
-    const remote = createSessionTestRemote(ctx, {
-      defaultModelSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }), cwd: '/tmp',
-    })
-    const events = [...agent.session.snapshotEvents()]
-    const followup = vi.fn()
-    Object.assign(agent, { followup })
-    expect(await remote.prompt(promptRequest({ sessionId, mode: 'queue', content: [{ type: 'text', text: 'hi' }] })))
-      .toMatchObject({ ok: true, value: { accepted: true } })
-    expect(followup).toHaveBeenCalledOnce()
-    expect(agent.session.snapshotEvents()).toEqual(events)
-    expect(currentSelection(ctx, sessionId)).toMatchObject({ provider: 'deepseek-official', model: 'removed-model' })
+    })))
+    const catalog = await buildModelCatalog(ctx)
+    expect(catalog.routableProviders.includes(currentSelection(ctx, sessionId).provider)).toBe(true)
+    expect(catalog.groups.flatMap(group => group.models.map(model => model.id)))
+      .not.toContain('unlisted-but-served')
     await ctx.fiber.dispose()
   })
 
@@ -806,13 +654,13 @@ describe('Web session model selection', () => {
           provider, id: model, name: model, inputModalities: ['text', 'image'],
         })
       }
-    }('Image Capable', [{ provider: 'image-capable', id: 'vision', name: 'Vision' }]))
+    }('Image Capable', []))
     ctx.llm.registerAdapter(['string-error'], new class extends CatalogAdapter {
       override resolveModel(): Promise<LlmResolvedModelInfo> {
         // oxlint-disable-next-line typescript/prefer-promise-reject-errors -- non-Error provider normalization is the scenario.
         return Promise.reject('string selection failure')
       }
-    }('String Error', [{ provider: 'string-error', id: 'plain', name: 'Plain' }]))
+    }('String Error', []))
     let saveMode: 'success' | 'error' | 'remote' = 'success'
     const savedRef = {
       attachmentId: 'saved-image', mediaType: 'image/png' as const, bytes: 1, width: 1, height: 1,
@@ -877,49 +725,16 @@ describe('Web session model selection', () => {
       sessionId, provider: 'image-capable', model: 'vision',
     })))
     expect(await remote.selectModel(request({
-      sessionId, provider: 'metadata-broken', model: 'listed',
+      sessionId, provider: 'metadata-broken', model: 'broken',
     }))).toMatchObject({
       ok: false, error: { code: 'session/model-unavailable', message: 'reasoning metadata offline' },
     })
     expect(await remote.selectModel(request({
-      sessionId, provider: 'string-error', model: 'plain',
+      sessionId, provider: 'string-error', model: 'broken',
     }))).toMatchObject({
       ok: false,
       error: { code: 'session/model-unavailable', message: 'string selection failure' },
     })
     await ctx.fiber.dispose()
   })
-})
-
-it('initializes the account model without reasoning metadata and rejects an empty account catalog', async () => {
-  const { configurationFixture } = await import('../../../settings/settings/tests/configuration-fixture.ts')
-  const configured = await configurationFixture({ hmr: false })
-  const { ctx } = await harness(undefined, configured.ctx)
-  ctx.provide('credentials', { describe: vi.fn() } as never)
-  const dispose = ctx.llm.registerAdapter(['deepseek-account'], new CatalogAdapter('Account', [
-    { provider: 'deepseek-account', id: 'basic', name: 'Basic' },
-  ]))
-  const controller = createSessionTestController(ctx, {
-    defaultModelSelection: () => ctx.agentDefaultModel.currentSelection(), cwd: '/tmp',
-  })
-  const save = vi.spyOn(ctx.agentDefaultModel, 'saveSelection')
-  await controller.initializeDefaultModel()
-  // The explicit default bootstrap is the path that owns writing the global default.
-  expect(save).toHaveBeenCalledExactlyOnceWith({ provider: 'deepseek-account', model: 'basic' })
-  expect(ctx.agentDefaultModel.currentSelection()).toEqual({ provider: 'deepseek-account', model: 'basic' })
-  save.mockRestore()
-  dispose()
-  await expect(controller.initializeDefaultModel()).rejects.toMatchObject({
-    code: 'session/provider-models-unavailable', details: { provider: 'deepseek-account' },
-  })
-})
-
-it.each([new Error('catalog disconnected'), 'catalog disconnected'])('reports catalog rejection as an unavailable selection: %s', async (failure) => {
-  const { ctx } = await harness()
-  const { modelAvailable } = await import('../src/catalog.ts')
-  const read = vi.spyOn(ctx.llm, 'listModels').mockRejectedValueOnce(failure)
-  try {
-    await expect(modelAvailable(ctx, { provider: 'deepseek-official', model: 'deepseek-chat' }))
-      .rejects.toMatchObject({ code: 'session/model-unavailable', message: 'catalog disconnected' })
-  } finally { read.mockRestore(); await ctx.fiber.dispose() }
 })
