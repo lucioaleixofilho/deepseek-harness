@@ -559,7 +559,7 @@ describe('Web session model selection', () => {
     await ctx.fiber.dispose()
   })
 
-  it('saves an accepted selection as the default and survives a storage failure', async () => {
+  it('changes only the addressed session and leaves the global default untouched', async () => {
     const { ctx, sessionId } = await harness()
     const saved: unknown[] = []
     let reject = false
@@ -575,13 +575,13 @@ describe('Web session model selection', () => {
     expectValue(await remote.selectModel(request({
       sessionId, provider: 'deepseek-official', model: 'deepseek-reasoner', reasoningEffort: 'max',
     })))
-    expect(saved).toEqual([
-      { provider: 'deepseek-official', model: 'deepseek-reasoner', reasoningEffort: 'max' },
-    ])
+    expect(saved).toEqual([])
+    expect(ctx.agentDefaultModel.currentSelection())
+      .toEqual({ provider: 'deepseek-official', model: 'deepseek-chat' })
 
     // A refused selection never becomes anyone's default.
     await remote.selectModel(request({ sessionId, provider: 'missing', model: 'model' }))
-    expect(saved).toHaveLength(1)
+    expect(saved).toHaveLength(0)
 
     // Storage failing is not the selection failing: the switch already applies
     // to this session, so the call still succeeds.
