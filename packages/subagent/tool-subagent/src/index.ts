@@ -54,6 +54,13 @@ export interface Config {
    */
   toolName?: string
   /**
+   * Model-facing tool description for this instance. When set, it replaces the
+   * whole derived description — provider wording plus background and selection
+   * guidance — so a second instance can state when the model should choose it.
+   * Omission keeps the derived description unchanged.
+   */
+  description?: string
+  /**
    * Sample the Host `subagent-model-selection` setting for each new top-level
    * Session and inherit that decision in its child Sessions.
    */
@@ -105,6 +112,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   provider: z.string().required(),
   toolName: z.string().default('subagent'),
+  description: z.string().min(1),
   modelSelectionSettings: z.boolean().default(false),
   enableRunInBackground: z.boolean().default(true),
   backgroundMode: z.union(['one-shot', 'continuable'] as const).default('one-shot'),
@@ -378,7 +386,9 @@ export function apply(ctx: Context, config: Config, session?: Session): void {
             : '')
       const disposeTool = runtimeCtx.tools.register(defineTool({
         name: toolName,
-        description: wording.description + (backgroundEnabled
+        // `??` binds looser than `+`: a configured description replaces the whole
+        // derived text, while omission keeps the derived text byte-identical.
+        description: config.description ?? wording.description + (backgroundEnabled
           // The completion notice is the continuation service's own behavior, not
           // a separately installed capability, so this promise holds whenever the
           // continuable background path is reachable at all.

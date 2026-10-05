@@ -463,6 +463,31 @@ describe('dsh-tool-subagent', () => {
     expect(props['prompt']!.description).toContain('completed turns')
   })
 
+  it('keeps the derived tool description byte-identical when no description is configured', async () => {
+    const ctx = await setup({ provider: 'mock' })
+    const schema = ctx.tools.schemas().find(s => s.name === 'subagent')!
+    expect(schema.description).toBe(
+      'Delegate a self-contained task to a subagent (a separate agent that works in its own context) '
+      + 'to offload focused, independent work — research, a scoped '
+      + 'implementation, an analysis — so it does not consume this conversation\'s context. The subagent '
+      + 'returns its result, not its intermediate steps. Give it a '
+      + 'complete, standalone prompt: it does not see this conversation.'
+      + ' This call waits for the result by default. Set `run_in_background: true` to return a job id; collect with `job_output` and stop with `job_kill`.',
+    )
+  })
+
+  it('uses a configured description verbatim instead of the derived wording', async () => {
+    const description = 'Use subagent_light for code search, reads, edits, shell commands, and tests; use subagent for MCP work.'
+    const ctx = await setup({ provider: 'mock', description })
+    const schema = ctx.tools.schemas().find(s => s.name === 'subagent')!
+    expect(schema.description).toBe(description)
+    expect(schema.description).not.toContain('does not see this conversation')
+  })
+
+  it('rejects an empty configured description at plugin load', async () => {
+    await expect(setup({ provider: 'mock', description: '' })).rejects.toThrow()
+  })
+
   it('disposes the run on the success path (no leaked child)', async () => {
     // Spy on the provider's run.dispose via a wrapping provider registered
     // directly on the service, then point the tool at it.
