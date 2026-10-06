@@ -470,9 +470,8 @@ describe('dsh-tool-subagent', () => {
       'Delegate a self-contained task to a subagent (a separate agent that works in its own context) '
       + 'to offload focused, independent work — research, a scoped '
       + 'implementation, an analysis — so it does not consume this conversation\'s context. The subagent '
-      + 'returns its result, not its intermediate steps. Give it a '
-      + 'complete, standalone prompt: it does not see this conversation.'
-      + ' This call waits for the result by default. Set `run_in_background: true` to return a job id; collect with `job_output` and stop with `job_kill`.',
+      + 'returns its result, not its intermediate steps.'
+      + ' This call waits for the result by default.',
     )
   })
 
