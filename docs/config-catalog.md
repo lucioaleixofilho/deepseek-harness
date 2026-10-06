@@ -3839,6 +3839,13 @@ export interface Config {
    */
   toolName?: string
   /**
+   * Model-facing tool description for this instance. When set, it replaces the
+   * whole derived description — provider wording plus background and selection
+   * guidance — so a second instance can state when the model should choose it.
+   * Omission keeps the derived description unchanged.
+   */
+  description?: string
+  /**
    * Sample the Host `subagent-model-selection` setting for each new top-level
    * Session and inherit that decision in its child Sessions.
    */
