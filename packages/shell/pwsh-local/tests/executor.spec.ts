@@ -469,7 +469,7 @@ describe.skipIf(!hasPwsh)('PwshLocalExecutor.run', () => {
   it('rejects unusable numeric config at the next command and invalid timeout overrides at resolve', async () => {
     for (const [config, field] of [
       [{ timeoutMs: Number.NaN }, /timeoutMs/], [{ maxTimeoutMs: 0 }, /maxTimeoutMs/], [{ maxOutputBytes: -1 }, /maxOutputBytes/],
-      [{ maxSpillBytes: 0 }, /maxSpillBytes/], [{ graceMs: 0 }, /graceMs/],
+      [{ maxSpillBytes: 0 }, /maxSpillBytes/], [{ graceMs: 0 }, /graceMs/], [{ backgroundMaxMs: -1 }, /backgroundMaxMs/],
       [{ graceMs: MAX_TIMER_DELAY_MS + 1 }, `graceMs must be no greater than ${MAX_TIMER_DELAY_MS}`],
     ] as const) {
       const { bash: unusable } = await setup(config)
@@ -737,6 +737,29 @@ describe.skipIf(!hasPwsh)('execute() projections under none policy', () => {
     controller.abort()
     await killed.done
     await expect(killed.result()).resolves.toMatchObject({ timedOut: false, aborted: true })
+  })
+})
+
+describe.skipIf(!hasPwsh)('background wall cap (backgroundMaxMs)', () => {
+  it('stops a background run past backgroundMaxMs and records the stop message', { timeout: 15_000 }, async () => {
+    const { bash } = await setup({ backgroundMaxMs: 300 })
+    const proc = (await start(bash, bash.resolve({ command: 'Start-Sleep -Seconds 60' })))
+    await proc.done
+    expect(proc.status).toBe('killed')
+    await expect(proc.result()).resolves.toMatchObject({ timedOut: true, aborted: false })
+    expect(lf(proc.readOutput().delta))
+      .toContain('background command exceeded backgroundMaxMs=300 ms and was stopped')
+  })
+
+  it('backgroundMaxMs=0 leaves the background run alive until kill()', { timeout: 15_000 }, async () => {
+    const { bash } = await setup({ backgroundMaxMs: 0 })
+    const proc = (await start(bash, bash.resolve({ command: 'Start-Sleep -Seconds 60' })))
+    await new Promise(resolve => setTimeout(resolve, 400))
+    expect(proc.status).toBe('running')
+    expect(proc.kill()).toBe(true)
+    await proc.done
+    expect(proc.status).toBe('killed')
+    expect(lf(proc.readOutput().delta)).not.toContain('background command exceeded')
   })
 })
 
