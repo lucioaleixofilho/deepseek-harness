@@ -62,6 +62,11 @@ export interface Config {
   timeoutMs: Volatile<number>
   /** Upper bound for per-call timeout overrides. */
   maxTimeoutMs: Volatile<number>
+  /**
+   * Wall-time cap for a background run (`onExpiry: 'none'`), in
+   * milliseconds; `0` disables the cap. Clamped to `MAX_TIMER_DELAY_MS`.
+   */
+  backgroundMaxMs: Volatile<number>
   /** Per-stream in-memory output cap; overflow spills to a temp file. */
   maxOutputBytes: Volatile<number>
   /** Per-stream spill-file cap; larger streams retain only their in-memory tail. */
@@ -98,6 +103,32 @@ function assertPositiveFinite(name: string, value: number): void {
 }
 
 /**
+ * Wrap a collect-mode reader so a late-arriving note reads as the stream's
+ * final line, at whole-stream byte offsets, once `note()` returns one. The
+ * background wall cap uses it to record its stop message on stderr, where the
+ * job readers that own a background run can see it.
+ * @param reader - the underlying non-consuming offset reader.
+ * @param note - the note text, or `undefined` while there is none.
+ * @returns the reader with the note appended to its stream once present.
+ */
+function appendStreamNote(reader: SubprocessOutputReader, note: () => string | undefined): SubprocessOutputReader {
+  return {
+    readFrom: (fromByte) => {
+      const read = reader.readFrom(fromByte)
+      const text = note()
+      if (text === undefined) return read
+      const suffix = Buffer.from(`${read.text.length > 0 && !read.text.endsWith('\n') ? '\n' : ''}${text}\n`, 'utf8')
+      const end = read.nextOffset
+      return {
+        text: fromByte >= end ? suffix.subarray(Math.min(fromByte - end, suffix.length)).toString('utf8') : read.text + suffix.toString('utf8'),
+        nextOffset: end + suffix.length,
+        lossy: read.lossy,
+      }
+    },
+  }
+}
+
+/**
  * Reject a resolved section this executor could not run with. The schema
  * expresses neither "positive and finite" nor the timer bound `graceMs` has to
  * fit, so a stored value that cannot be used fails at the next command.
@@ -107,6 +138,9 @@ function assertPositiveFinite(name: string, value: number): void {
 export function assertServiceablePwshConfig(config: Config): void {
   assertPositiveFinite('timeoutMs', config.timeoutMs.get())
   assertPositiveFinite('maxTimeoutMs', config.maxTimeoutMs.get())
+  if (!Number.isFinite(config.backgroundMaxMs.get()) || config.backgroundMaxMs.get() < 0) {
+    throw new Error('pwsh-local: backgroundMaxMs must be a non-negative finite number')
+  }
   assertPositiveFinite('maxOutputBytes', config.maxOutputBytes.get())
   assertPositiveFinite('maxSpillBytes', config.maxSpillBytes.get())
   assertPositiveFinite('graceMs', config.graceMs.get())
@@ -127,6 +161,7 @@ export class PwshLocalExecutor extends ShellExecutor {
     cwd: z.string().volatile(),
     timeoutMs: z.number().default(120_000).volatile(),
     maxTimeoutMs: z.number().default(600_000).volatile(),
+    backgroundMaxMs: z.number().default(3_600_000).volatile(),
     maxOutputBytes: z.number().default(64_000).volatile(),
     maxSpillBytes: z.number().default(DEFAULT_MAX_SPILL_BYTES).volatile(),
     graceMs: z.number().default(DEFAULT_GRACE_MS).volatile(),
@@ -254,6 +289,8 @@ export class PwshLocalExecutor extends ShellExecutor {
     let spawnSignal: AbortSignal | undefined
     let classify: () => { timedOut: boolean; aborted: boolean }
     let disarm = (): void => {}
+    /** The background wall-cap note, present once the cap has stopped the run. */
+    let backgroundNote: () => string | undefined = () => undefined
     if (spec.onExpiry === 'kill') {
       // One fused deadline combines timeout and upstream cancellation; only
       // this executor's timeout reason counts as timedOut, outer deadlines as aborts.
@@ -265,9 +302,23 @@ export class PwshLocalExecutor extends ShellExecutor {
       }
       disarm = () => { d[Symbol.dispose]() }
     } else {
-      // No deadline: callers stop the process through kill() or spec.signal.
-      spawnSignal = spec.signal
-      classify = () => ({ timedOut: false, aborted: spec.signal?.aborted === true })
+      // A background run keeps its own wall cap: `backgroundMaxMs` bounds how
+      // long a detached run may live (0 disables the cap), and the caller's
+      // signal remains the other way to stop it. The cap aborts the spawn
+      // signal, so the subprocess service terminates the managed range.
+      const d = deadline(spec.signal, Math.min(this.config.backgroundMaxMs.get(), MAX_TIMER_DELAY_MS), 'BASH_TIMEOUT')
+      spawnSignal = d.signal
+      classify = () => {
+        const timedOut = timeoutOf(d.signal, 'BASH_TIMEOUT') !== undefined
+        return { timedOut, aborted: d.signal.aborted && !timedOut }
+      }
+      disarm = () => { d[Symbol.dispose]() }
+      backgroundNote = () => {
+        const reason = timeoutOf(d.signal, 'BASH_TIMEOUT')
+        return reason === undefined
+          ? undefined
+          : `background command exceeded backgroundMaxMs=${reason.timeoutMs} ms and was stopped`
+      }
     }
 
     let argv: readonly string[] = []
@@ -311,6 +362,9 @@ export class PwshLocalExecutor extends ShellExecutor {
     const collected = running !== undefined
       ? PwshLocalExecutor.collected(running)
       : { stdout: emptyReader, stderr: emptyReader }
+    // Every stderr consumer reads the same stream, including the background
+    // wall-cap note once it is present.
+    const stderr = appendStreamNote(collected.stderr, backgroundNote)
     const spawnThrow = (): unknown => (syncSpawnError as { error: unknown }).error
     const spawned = preparationTimedOut
       ? Promise.resolve({ exitCode: null, signal: null })
@@ -334,7 +388,7 @@ export class PwshLocalExecutor extends ShellExecutor {
     }
     const observedStderr: SubprocessOutputReader = {
       readFrom: (fromByte) => {
-        if (providerFailure === undefined) return collected.stderr.readFrom(fromByte)
+        if (providerFailure === undefined) return stderr.readFrom(fromByte)
         const note = Buffer.from(providerFailure.note, 'utf8')
         return { text: note.subarray(Math.min(fromByte, note.length)).toString('utf8'), nextOffset: note.length, lossy: false }
       },
@@ -355,7 +409,7 @@ export class PwshLocalExecutor extends ShellExecutor {
         }
         proc.exitCode = outcome.exitCode
         proc.signal = outcome.signal
-        this.onProcessDone(proc, collected.stderr.readFrom(0).text, false)
+        this.onProcessDone(proc, stderr.readFrom(0).text, false)
         disarm()
       }, (error: unknown) => {
         // A live handle whose rejection follows this execution's own
@@ -367,7 +421,7 @@ export class PwshLocalExecutor extends ShellExecutor {
         // synchronous spawn throw never produced a handle and stays a failure.
         if (running !== undefined && (proc.status === 'killed' || spawnSignal?.aborted === true)) {
           proc.status = 'killed'
-          this.onProcessDone(proc, collected.stderr.readFrom(0).text, false)
+          this.onProcessDone(proc, stderr.readFrom(0).text, false)
           disarm()
           return
         }
@@ -385,7 +439,7 @@ export class PwshLocalExecutor extends ShellExecutor {
       }),
       readOutput: (): ShellProcessRead => {
         const out = collected.stdout.readFrom(stdoutOffset)
-        const err = collected.stderr.readFrom(stderrOffset)
+        const err = stderr.readFrom(stderrOffset)
         stdoutOffset = out.nextOffset
         stderrOffset = err.nextOffset
 
@@ -422,7 +476,7 @@ export class PwshLocalExecutor extends ShellExecutor {
             ...classify(),
             timeoutMs: spec.timeoutMs,
             stdout: finalOutput(collected.stdout),
-            stderr: finalOutput(collected.stderr),
+            stderr: finalOutput(stderr),
           }
         })
         return resultPromise

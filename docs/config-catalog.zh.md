@@ -402,6 +402,11 @@ export interface Config {
   timeoutMs: Volatile<number>
   /** Upper bound for per-call timeout overrides. */
   maxTimeoutMs: Volatile<number>
+  /**
+   * Wall-time cap for a background run (`onExpiry: 'none'`), in
+   * milliseconds; `0` disables the cap. Clamped to `MAX_TIMER_DELAY_MS`.
+   */
+  backgroundMaxMs: Volatile<number>
   /** Per-stream in-memory output cap; overflow spills to a temp file. */
   maxOutputBytes: Volatile<number>
   /** Per-stream spill-file cap; larger streams retain only their in-memory tail. */
@@ -2359,6 +2364,11 @@ export interface Config {
   timeoutMs: Volatile<number>
   /** Upper bound for per-call timeout overrides. */
   maxTimeoutMs: Volatile<number>
+  /**
+   * Wall-time cap for a background run (`onExpiry: 'none'`), in
+   * milliseconds; `0` disables the cap. Clamped to `MAX_TIMER_DELAY_MS`.
+   */
+  backgroundMaxMs: Volatile<number>
   /** Per-stream in-memory output cap; overflow spills to a temp file. */
   maxOutputBytes: Volatile<number>
   /** Per-stream spill-file cap; larger streams retain only their in-memory tail. */
